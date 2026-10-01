@@ -247,6 +247,14 @@ class Service:
         if detail == "all" and result.bytecode is not None:
             view["bytecode"] = result.bytecode.to_dict()
             view["bytecode"]["functions"].reverse()
+        if "cfg" in detail or detail == "all":
+            if result.bytecode is not None:
+                from . import cfg as cfg_mod
+                cfg = cfg_mod.build_program_cfg(result.bytecode)
+                # 与字节码页的函数标签顺序保持一致（用户函数在前，<main> 在末）
+                cfg["functions"].reverse()
+                # call_graph.nodes 顺序不依赖反转（按名字建图），保持程序序
+                view["cfg"] = cfg
         return view
 
     # ==================================================================

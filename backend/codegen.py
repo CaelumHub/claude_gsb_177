@@ -129,11 +129,13 @@ class CodeGenerator:
             else:
                 self._emit(bc.OP_RETURN_NONE, None, s.line)
         elif isinstance(s, ast.BreakStmt):
-            self._emit(bc.OP_JUMP, None, s.line)  # 目标在循环里回填
-            self._break_stack[-1].append(self.current.instructions[-1])
+            ins = self._emit(bc.OP_JUMP, None, s.line)  # 目标在循环里回填
+            ins.note = "break"
+            self._break_stack[-1].append(ins)
         elif isinstance(s, ast.ContinueStmt):
-            self._emit(bc.OP_JUMP, None, s.line)  # 目标在循环里回填
-            self._continue_stack[-1].append(self.current.instructions[-1])
+            ins = self._emit(bc.OP_JUMP, None, s.line)  # 目标在循环里回填
+            ins.note = "continue"
+            self._continue_stack[-1].append(ins)
 
     def _if(self, s: ast.IfStmt):
         end_jumps = []
@@ -155,9 +157,11 @@ class CodeGenerator:
         loop_start = self._here()
         self._expr(s.condition)
         jump_false = self._emit(bc.OP_JUMP_IF_FALSE, 0, s.condition.line)
+        jump_false.note = "while_exit"
         self._stmt(s.body)
         continue_target = self._here()
-        self._emit(bc.OP_JUMP, loop_start, s.line)
+        back = self._emit(bc.OP_JUMP, loop_start, s.line)
+        back.note = "while_back"
         end = self._here()
         self._patch(jump_false, end)
         for b in self._break_stack[-1]:
@@ -178,11 +182,13 @@ class CodeGenerator:
         else:
             self._emit(bc.OP_LOAD_CONST, True, s.line)
         jump_false = self._emit(bc.OP_JUMP_IF_FALSE, 0, s.line)
+        jump_false.note = "for_exit"
         self._stmt(s.body)
         continue_target = self._here()
         if s.increment:
             self._expr_stmt(s.increment, s.increment.line)
-        self._emit(bc.OP_JUMP, loop_start, s.body.line)
+        back = self._emit(bc.OP_JUMP, loop_start, s.body.line)
+        back.note = "for_back"
         end = self._here()
         self._patch(jump_false, end)
         for b in self._break_stack[-1]:
@@ -340,23 +346,43 @@ class CodeGenerator:
           3. 连续 LOAD_CONST x; LOAD_CONST x -> 保留其一（去重由 add_const 完成）
           4. JUMP -> JUMP 目标折叠（把跳转到跳转的指令直接指向最终目标）
           5. 消除 NOP
+
+        删除指令会改变后续指令下标，因此每轮收缩都要把所有跳转操作数
+        按旧下标 -> 新下标的映射重定位（否则跳转目标会错位/越界）。
         """
         ins = fc.instructions
+
+        def shrink(keep):
+            """按 keep 谓词保留指令，并把跳转目标重定位到新下标。
+            返回（新指令列表, 是否发生变化）。"""
+            n = len(ins)
+            new = [i for i in ins if keep(i)]
+            if len(new) == n:
+                return ins, False
+            # old_idx -> new_idx；被删指令映射到其后第一条保留指令
+            remap = [0] * (n + 1)
+            j = 0
+            for k in range(n):
+                if k < len(new) and new[j] is ins[k]:
+                    remap[k] = j
+                    j += 1
+                else:
+                    remap[k] = min(j, len(new))
+            remap[n] = len(new)
+            for i in new:
+                if i.op in (bc.OP_JUMP, bc.OP_JUMP_IF_FALSE, bc.OP_JUMP_IF_TRUE):
+                    t = i.operand
+                    i.operand = remap[min(max(t, 0), n)] if isinstance(t, int) else t
+            return new, True
+
         # 多次扫描直到不动点（跳转折叠可能引发新的可折叠跳转）
         changed = True
         while changed:
             changed = False
-            # 先建立当前偏移 -> 指令的映射
-            new = []
-            skip = 0
-            for i in ins:
-                if i.op == bc.OP_NOP:
-                    changed = True
-                    continue
-                new.append(i)
-            if len(new) != len(ins):
-                changed = True
-            ins = new
+
+            # 消除 NOP
+            ins, did = shrink(lambda i: i.op != bc.OP_NOP)
+            changed = changed or did
 
             # 重算偏移
             for idx, i in enumerate(ins):
@@ -374,20 +400,19 @@ class CodeGenerator:
                         i.operand = t
                         changed = True
 
-            # LOAD_CONST + POP 消除
-            nxt = []
+            # LOAD_CONST + POP 消除（删除后同步重定位跳转目标）
+            removed = set()
             i = 0
-            while i < len(ins):
-                if (i + 1 < len(ins) and ins[i].op == bc.OP_LOAD_CONST
-                        and ins[i + 1].op == bc.OP_POP):
-                    changed = True
+            while i + 1 < len(ins):
+                if ins[i].op == bc.OP_LOAD_CONST and ins[i + 1].op == bc.OP_POP:
+                    removed.add(id(ins[i]))
+                    removed.add(id(ins[i + 1]))
                     i += 2
                     continue
-                nxt.append(ins[i])
                 i += 1
-            if len(nxt) != len(ins):
+            if removed:
+                ins, _ = shrink(lambda x: id(x) not in removed)
                 changed = True
-            ins = nxt
 
         # 最终回填偏移与行号映射
         fc.instructions = ins

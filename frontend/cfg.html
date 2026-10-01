@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>控制流图（CFG） · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <div class="flex wrap" style="gap:8px">
+          <label class="flex" style="gap:5px;font-size:12px;color:var(--text-muted)">
+            <input type="checkbox" id="opt-dead" checked> 显示不可达块
+          </label>
+          <button class="btn primary" id="btn-build">🔀 生成控制流图</button>
+        </div>
+      </div>
+
+      <div id="editor"></div>
+
+      <div class="card mt">
+        <div class="flex between">
+          <h2>控制流图（Control-Flow Graph）</h2>
+          <div id="cfg-stats" class="muted" style="font-size:12px"></div>
+        </div>
+        <div class="desc">
+          由优化后的字节码直接构建，与「字节码 / 中间代码」页的偏移（框内 1-based 偏移）、行号严格对齐。
+          每个方框是一个基本块；边为块间控制流：真/假分支、顺序、break / continue、循环回边、返回退出。
+          调用点标注被调函数（含递归自调用）。提前 return 后不可达的指令仍保留为虚线块，不漏指令。
+        </div>
+        <div id="cfg-tabs" class="cfg-tabs"></div>
+        <div class="card" style="box-shadow:none;background:var(--surface-2);margin-bottom:12px">
+          <h3 style="margin-top:0">📞 函数调用关系</h3>
+          <div id="callgraph" class="cfg-callgraph"></div>
+        </div>
+        <div class="cfg-legend mb" id="legend"></div>
+        <div class="cfg-scroll" id="cfg-scroll" style="max-height:68vh">
+          <div id="cfg-canvas" class="cfg-canvas"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+/* ============================================================
+   控制流图页面
+   - 数据来自 /api/compile 的 result.cfg（后端从字节码构建）
+   - 纯原生 JS + SVG：纵向按基本块偏移排布，嵌套循环缩进，
+     边沿两侧通道做正交路由（greedy lane 分配，避免重叠）
+   ============================================================ */
+(function () {
+  ML.Shell.render("cfg");
+  ML.Shell.setTitle("控制流图（CFG）");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE), height: 200,
+  });
+  const esc = ML.escapeHtml;
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${esc(s.name)}</option>`).join("");
+  sampleSel.onchange = () => { if (sampleSel.value !== "") { editor.setValue(ML.SAMPLES[+sampleSel.value].code); sampleSel.value = ""; } };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  /* ----------------------------------------------------------
+   * 布局常量
+   * ---------------------------------------------------------- */
+  const BW = 300;            // 基本块宽
+  const INDENT = 34;         // 每层循环缩进
+  const PAD = 30;            // 画布左右内边距
+  const TOP0 = 44;           // 入口圆点上方空间
+  const GAP = 30;            // 块垂直间距
+  const ROW = 18;            // 每条指令行高
+  const HEAD = 25;           // 块标题高
+  const CALLROW = 23;        // 调用点条高
+  const EXIT_H = 30;
+  const LANE = 16;           // 通道宽度
+  const RIGHT0 = BW + 18;    // 右侧第一通道起点
+  const LEFT0 = -26;         // 左侧通道（相对块左缘）
+
+  let DATA = null, curFn = 0;
+
+  /* ----------------------------------------------------------
+   * 图例
+   * ---------------------------------------------------------- */
+  const LEGEND = [
+    ["var(--success)", "solid", "条件为真"],
+    ["var(--info)", "solid", "条件为假 / continue"],
+    ["var(--text-muted)", "solid", "汇合 / 跳转"],
+    ["var(--primary)", "solid", "循环回边"],
+    ["var(--danger)", "solid", "break"],
+    ["var(--danger)", "dashed", "返回 / 退出"],
+    ["var(--border-strong)", "solid", "顺序执行"],
+  ];
+  document.getElementById("legend").innerHTML = LEGEND.map(([c, st, t]) =>
+    `<span><span class="sw" style="border-top-color:${c};border-top-style:${st}"></span>${esc(t)}</span>`).join("");
+
+  /* ----------------------------------------------------------
+   * 渲染主入口
+   * ---------------------------------------------------------- */
+  function operandText(ins) {
+    const o = ins.operand;
+    if (ins.op === "JUMP" || ins.op === "JUMP_IF_FALSE" || ins.op === "JUMP_IF_TRUE")
+      return `<span class="arg">→ ${o}</span>`;
+    if (o === null || o === undefined || o === "") return '<span class="muted">—</span>';
+    return `<span class="arg">${esc(String(o))}</span>`;
+  }
+
+  function insClass(ins) {
+    if (ins.op.indexOf("JUMP") === 0) return "jump";
+    if (ins.op === "RETURN" || ins.op === "RETURN_NONE") return "ret";
+    if (ins.op === "CALL") return "call";
+    return "";
+  }
+
+  function blockHeight(b) {
+    let h = HEAD + b.instructions.length * ROW;
+    if (b.calls.length) h += CALLROW;
+    return h;
+  }
+
+  function render() {
+    const cfg = DATA;
+    const f = cfg.functions[curFn];
+    const showDead = document.getElementById("opt-dead").checked;
+    const blocks = f.blocks;
+    const visible = blocks.filter(b => showDead || b.reachable);
+    const visibleIds = new Set(visible.map(b => b.id));
+    const byId = id => blocks[id];
+
+    /* ---- 1) 块几何：y 顺序排布；x 按最大循环嵌套深度缩进 ---- */
+    const geo = {};   // id -> {x,y,w,h}
+    let y = TOP0;
+    let maxDepth = 0;
+    for (const b of visible) {
+      maxDepth = Math.max(maxDepth, b.loop_depth);
+    }
+    const depthX = d => PAD + 12 + d * INDENT;
+    for (const b of visible) {
+      const h = blockHeight(b);
+      geo[b.id] = { x: depthX(Math.max(0, b.loop_depth - 0)), y, w: BW, h, cx: depthX(b.loop_depth) + BW / 2 };
+      y += h + GAP;
+    }
+    const exitY = y - 4;
+
+    /* ---- 2) 边分类：直线边（顺序/相邻真分支）、左通道（回边）、右通道（其余） ---- */
+    function edgeSpan(e) {
+      const sy = geo[e.src].y + geo[e.src].h;
+      const ty = e.to_exit ? exitY + EXIT_H / 2 : geo[e.dst].y;
+      return { y1: Math.min(sy, ty), y2: Math.max(sy, ty) + 8 };
+    }
+    function nextVisibleId(id) {
+      const idx = visible.findIndex(b => b.id === id);
+      return idx >= 0 && idx + 1 < visible.length ? visible[idx + 1].id : -1;
+    }
+    const leftEdges0 = [], rightEdges0 = [], straight0 = [];
+    for (const e of f.edges) {
+      if (!visibleIds.has(e.src)) continue;
+      if (!e.to_exit && !visibleIds.has(e.dst)) { rightEdges0.push(e); continue; }
+      const adjacent = !e.to_exit && e.dst === nextVisibleId(e.src);
+      if (e.kind === "fall") { straight0.push(e); continue; }
+      if (e.kind === "branch" && adjacent && e.label.indexOf("真") === 0) { straight0.push(e); continue; }
+      if (e.note === "back" || e.back) leftEdges0.push(e);
+      else rightEdges0.push(e);
+    }
+    // 左通道宽度（与右通道同样按重叠数估算，预留画布空间）
+    const leftNeed = maxOverlap(leftEdges0, edgeSpan);
+    const shiftX = 24 + leftNeed * LANE;
+
+    function maxOverlap(edges, spanFn) {
+      if (!edges.length) return 0;
+      const pts = [];
+      edges.forEach(e => { const s = spanFn(e); pts.push([s.y1, 1], [s.y2, -1]); });
+      pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      let cur = 0, mx = 0;
+      pts.forEach(p => { cur += p[1]; mx = Math.max(mx, cur); });
+      return mx;
+    }
+    function assignLanes(edges, side) {
+      const items = edges.map(e => ({ e, ...edgeSpan(e) })).sort((a, b) => a.y1 - b.y1);
+      const lanes = [];
+      for (const it of items) {
+        let placed = false;
+        for (let li = 0; li < lanes.length; li++) {
+          if (lanes[li] <= it.y1) { lanes[li] = it.y2; it.lane = li; placed = true; break; }
+        }
+        if (!placed) { it.lane = lanes.length; lanes.push(it.y2); }
+      }
+      for (const it of items) {
+        const baseX = geo[it.e.src].x + shiftX;
+        it.xAbs = side === "right"
+          ? baseX + RIGHT0 + it.lane * LANE
+          : baseX + LEFT0 - it.lane * LANE;
+      }
+      return { count: lanes.length, items };
+    }
+    const straight = straight0;
+    const R = assignLanes(rightEdges0, "right");
+    const L = assignLanes(leftEdges0, "left");
+    const laneMap = new Map([...R.items, ...L.items].map(it => [it.e, it]));
+
+    /* ---- 3) 画布尺寸（左侧通道 + 块区 + 右侧通道） ---- */
+    const width = shiftX + PAD * 2 + maxDepth * INDENT + BW + R.count * LANE + 20;
+    const height = exitY + EXIT_H + 26;
+    const canvas = document.getElementById("cfg-canvas");
+    canvas.style.width = width + "px";
+    canvas.style.height = height + "px";
+
+    /* ---- 4) 循环区域框（外 -> 内绘制） ---- */
+    let loopHtml = "";
+    const sortedLoops = [...f.loops].sort((a, b) => b.blocks.length - a.blocks.length);
+    for (const lp of sortedLoops) {
+      const mem = lp.blocks.filter(id => visibleIds.has(id)).map(id => geo[id]);
+      if (!mem.length) continue;
+      const x1 = Math.min(...mem.map(g => g.x)) - 10;
+      const x2 = Math.max(...mem.map(g => g.x + g.w)) + 10;
+      const y1 = Math.min(...mem.map(g => g.y)) - 14;
+      const y2 = Math.max(...mem.map(g => g.y + g.h)) + 8;
+      const dcls = "depth-" + Math.min(3, lp.depth);
+      loopHtml += `<div class="cfg-loop-box ${dcls}" style="left:${x1 + shiftX}px;top:${y1}px;width:${x2 - x1}px;height:${y2 - y1}px">
+        <span class="lp-tag">🔁 ${esc(lp.name)} L${lp.line_start}–L${lp.line_end} · 深度 ${lp.depth}</span></div>`;
+    }
+
+    /* ---- 5) 入口 / 出口圆点 ---- */
+    const g0 = geo[visible[0].id];
+    const anchorHtml =
+      `<div class="cfg-entry" style="left:${g0.cx - 46 + shiftX}px;top:8px">入口</div>` +
+      `<div class="cfg-exit" style="left:${g0.cx - 46 + shiftX}px;top:${exitY}px">返回 EXIT</div>`;
+
+    /* ---- 6) 基本块 ---- */
+    let blocksHtml = "";
+    for (const b of visible) {
+      const g = geo[b.id];
+      const tags = [];
+      if (b.is_entry) tags.push('<span class="tag entry">ENTRY</span>');
+      if (b.is_loop_header) tags.push('<span class="tag">循环头</span>');
+      if (b.has_return) tags.push('<span class="tag ret">含 return</span>');
+      if (!b.reachable) tags.push('<span class="tag dead">不可达</span>');
+      let insHtml = b.instructions.map(ins => {
+        const title = `索引 ${ins.offset - 1}（偏移 ${ins.offset}）· 源第 ${ins.line} 行`;
+        return `<div class="ins ${insClass(ins)}" data-bid="${b.id}" data-line="${ins.line}" title="${esc(title)}">
+          <span class="off">${ins.offset}</span><span class="op">${esc(ins.op)}</span>
+          ${operandText(ins)}<span class="ln">L${ins.line}</span></div>`;
+      }).join("");
+      let callsHtml = "";
+      if (b.calls.length) {
+        callsHtml = `<div class="call-row">` + b.calls.map(c => {
+          if (c.callee_kind === "user")
+            return `<button class="cfg-chip" data-fn="${esc(c.callee)}" title="跳转到函数 ${esc(c.callee)} 的控制流图">📞 ${esc(c.label)}</button>`;
+          return `<button class="cfg-chip bi" title="内置函数，无子图">${esc(c.label)}</button>`;
+        }).join("") + `</div>`;
+      }
+      blocksHtml += `<div class="cfg-block depth-${Math.min(3, b.loop_depth)} ${b.reachable ? "" : "unreachable"}"
+        data-bid="${b.id}" style="left:${g.x + shiftX}px;top:${g.y}px">
+        <div class="bb-head"><span class="bid">B${b.id}</span>${tags.join("")}
+          <span class="rng">off ${b.start}–${b.end} · L${b.line_start}${b.line_end !== b.line_start ? "–L" + b.line_end : ""}</span>
+        </div>${insHtml}${callsHtml}</div>`;
+    }
+
+    /* ---- 7) SVG 边 ---- */
+    function blockPort(bid, where) {
+      const g = geo[bid];
+      return { x: g.cx + shiftX, y: where === "top" ? g.y : g.y + g.h };
+    }
+    const exitPort = { x: g0.cx + shiftX, y: exitY };
+    let paths = "";
+    function arrowFor(color) {
+      if (color.indexOf("danger") >= 0) return "url(#arr-danger)";
+      if (color.indexOf("primary") >= 0) return "url(#arr-primary)";
+      if (color.indexOf("info") >= 0) return "url(#arr-info)";
+      if (color.indexOf("success") >= 0) return "url(#arr-success)";
+      return "url(#arr-muted)";
+    }
+    function colorFor(e) {
+      if (e.kind === "return") return "var(--danger)";
+      if (e.note === "break" || e.label === "break") return "var(--danger)";
+      if (e.note === "continue" || e.label === "continue") return "var(--info)";
+      if (e.note === "back" || e.back) return "var(--primary)";
+      if (e.kind === "branch") {
+        return e.label.indexOf("假") === 0 ? "var(--info)" : "var(--success)";
+      }
+      return "var(--text-muted)";
+    }
+    function clsFor(e) {
+      if (e.kind === "return") return "e-return";
+      if (e.note === "break" || e.label === "break") return "e-break";
+      if (e.note === "continue" || e.label === "continue") return "e-continue";
+      if (e.note === "back" || e.back) return "e-back";
+      if (e.kind === "branch") return "e-branch " + (e.label.indexOf("假") === 0 ? "" : "true");
+      if (e.kind === "fall") return "e-fall";
+      return "e-jump";
+    }
+
+    // 顺序 / 相邻真分支：直线
+    for (const e of straight) {
+      const s = blockPort(e.src, "bottom");
+      if (e.to_exit) {
+        paths += `<path class="e-return" d="M ${s.x} ${s.y} L ${exitPort.x} ${exitPort.y}"
+          data-src="${e.src}" stroke="var(--danger)" stroke-dasharray="5 3" marker-end="url(#arr-danger)"/>`;
+      } else {
+        const d = blockPort(e.dst, "top");
+        const lbl = e.kind === "branch" ? e.label.replace("·短路", "") : "";
+        paths += `<path class="${clsFor(e)}" d="M ${s.x} ${s.y} L ${d.x} ${d.y}"
+          data-src="${e.src}" data-dst="${e.dst}" stroke="${colorFor(e)}" marker-end="${arrowFor(colorFor(e))}"/>`;
+        if (lbl) paths += `<text class="elbl" x="${s.x + 6}" y="${(s.y + d.y) / 2 - 2}">${esc(lbl)}</text>`;
+      }
+    }
+
+    // 通道边（右：假分支/break/返回等；左：循环回边）
+    for (const [e, item] of laneMap.entries()) {
+      if (!visibleIds.has(e.src) || (!e.to_exit && !visibleIds.has(e.dst))) continue;
+      const s = blockPort(e.src, "bottom");
+      const d = e.to_exit ? { ...exitPort } : blockPort(e.dst, "top");
+      const xAbs = item.xAbs;
+      const cls = clsFor(e), color = colorFor(e);
+      const path = `M ${s.x} ${s.y} L ${xAbs} ${s.y} L ${xAbs} ${d.y} L ${d.x} ${d.y}`;
+      paths += `<path class="${cls}" d="${path}" data-src="${e.src}" ${e.to_exit ? "" : `data-dst="${e.dst}"`}
+        stroke="${color}" marker-end="${arrowFor(color)}"/>`;
+      // 标签放在通道竖线旁（源块下方）
+      const ly = Math.min(s.y, d.y) + 12;
+      const tx = item.side === "right" ? xAbs + 4 : xAbs - 4;
+      const anchor = item.side === "right" ? "start" : "end";
+      paths += `<text class="elbl" x="${tx}" y="${ly}" text-anchor="${anchor}">${esc(e.label)}</text>`;
+    }
+
+    const svgDefs = `
+      <marker id="arr-danger" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--danger)"/></marker>
+      <marker id="arr-primary" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--primary)"/></marker>
+      <marker id="arr-info" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--info)"/></marker>
+      <marker id="arr-success" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--success)"/></marker>
+      <marker id="arr-muted" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--text-muted)"/></marker>`;
+    const svgHtml = `<svg class="cfg-edges" width="${width}" height="${height}">${svgDefs}${paths}</svg>`;
+
+    canvas.innerHTML = svgHtml + loopHtml + anchorHtml + blocksHtml;
+
+    /* ---- 8) 交互：块/边联动高亮、调用跳转、点击行定位 ---- */
+    const blockEls = canvas.querySelectorAll(".cfg-block");
+    function setHighlight(bid, on) {
+      canvas.querySelectorAll(`.cfg-block[data-bid="${bid}"]`).forEach(el => el.classList.toggle("sel", on));
+      canvas.querySelectorAll(`path[data-src="${bid}"]`).forEach(el => el.classList.toggle("hl", on));
+      canvas.querySelectorAll(`path[data-dst="${bid}"]`).forEach(el => el.classList.toggle("hl", on));
+    }
+    blockEls.forEach(el => {
+      const bid = +el.dataset.bid;
+      el.addEventListener("mouseenter", () => setHighlight(bid, true));
+      el.addEventListener("mouseleave", () => setHighlight(bid, false));
+      el.addEventListener("click", () => {
+        const b = byId(bid);
+        ML.toast(`B${bid} · 偏移 ${b.start}–${b.end} · 行 ${b.line_start}${b.line_end !== b.line_start ? "–" + b.line_end : ""} · 循环深度 ${b.loop_depth}`);
+      });
+    });
+    canvas.querySelectorAll(".cfg-chip[data-fn]").forEach(chip => {
+      chip.addEventListener("click", () => {
+        const name = chip.dataset.fn;
+        const idx = DATA.functions.findIndex(x => x.name === name);
+        if (idx >= 0) { curFn = idx; renderTabs(); render(); }
+      });
+    });
+    // 不可达块被隐藏时，滚动定位到第一个块
+    document.getElementById("cfg-scroll").scrollTop = 0;
+  }
+
+  /* ----------------------------------------------------------
+   * 函数标签 + 调用图
+   * ---------------------------------------------------------- */
+  function renderTabs() {
+    const el = document.getElementById("cfg-tabs");
+    el.innerHTML = DATA.functions.map((f, i) => {
+      const cg = DATA.call_graph.nodes.find(n => n.name === f.name);
+      const recMark = cg && cg.recursion === "self"
+        ? '<span class="rec" title="直接递归">↻</span>'
+        : cg && cg.recursion === "mutual" ? '<span class="rec" title="互递归">⇌</span>' : "";
+      const label = f.is_main ? "&lt;main&gt;（顶层）" : `${esc(f.name)}(${f.params.join(", ")})`;
+      return `<button class="cfg-tab ${i === curFn ? "active" : ""}" data-i="${i}">${label}
+        <span class="muted">${f.blocks.length}块/${f.edges.length}边</span>${recMark}</button>`;
+    }).join("");
+    el.querySelectorAll("button").forEach(b => b.onclick = () => { curFn = +b.dataset.i; renderTabs(); render(); });
+  }
+
+  function renderCallGraph() {
+    const el = document.getElementById("callgraph");
+    const cg = DATA.call_graph;
+    let html = "";
+    const byName = Object.fromEntries(cg.nodes.map(n => [n.name, n]));
+    // 每个函数一行：函数名 → 它调用的用户函数（自递归用 ↻ 标注）
+    cg.nodes.forEach(n => {
+      const outs = cg.edges.filter(e => e.caller === n.name &&
+        !(n.recursion === "mutual" && byName[e.callee] && byName[e.callee].recursion === "mutual"));
+      const selfCls = n.recursion === "self" || n.recursion === "mutual" ? "rec" : "";
+      const mark = n.recursion === "self" ? " ↻" : "";
+      html += `<span class="cg-wrap">`;
+      html += `<button class="cg-node ${n.is_main ? "main " : ""}${selfCls}" data-fn="${esc(n.name)}"
+        title="查看 ${esc(n.name)} 的 CFG">${esc(n.name)}${mark}</button>`;
+      if (outs.length) {
+        html += `<span class="cg-arrow">→</span>` + outs.map(e =>
+          `<button class="cg-node ${byName[e.callee] && byName[e.callee].recursion ? "rec" : ""}" data-fn="${esc(e.callee)}">${esc(e.callee)}${e.count > 1 ? " ×" + e.count : ""}</button>`
+        ).join('<span class="cg-arrow">·</span>');
+      }
+      html += `</span>`;
+    });
+    // 互递归分组说明
+    const mutual = cg.recursive_groups.filter(g => g.length > 1);
+    if (mutual.length) {
+      html += `<div class="muted" style="width:100%;font-size:11.5px">⇌ 互递归组：${
+        mutual.map(g => g.join(" ↔ ")).join("；")}</div>`;
+    }
+    el.innerHTML = html || '<span class="muted">（无函数调用）</span>';
+    el.querySelectorAll("[data-fn]").forEach(b => b.onclick = () => {
+      const idx = DATA.functions.findIndex(f => f.name === b.dataset.fn);
+      if (idx >= 0) { curFn = idx; renderTabs(); render(); }
+    });
+  }
+
+  /* ----------------------------------------------------------
+   * 编译
+   * ---------------------------------------------------------- */
+  async function build() {
+    const code = editor.getValue();
+    ML.store.set("draft_source", code);
+    const data = await ML.api.compile(code);
+    const r = data.result || {};
+    if (!r.success || !r.cfg) {
+      document.getElementById("cfg-tabs").innerHTML = "";
+      document.getElementById("callgraph").innerHTML = "";
+      document.getElementById("cfg-canvas").innerHTML =
+        `<div class="empty"><div class="big">🚫</div>无法生成控制流图（编译未通过）。<br><a href="diagnostics.html">前往诊断页查看错误</a></div>`;
+      document.getElementById("cfg-stats").textContent = "";
+      DATA = null;
+      return;
+    }
+    DATA = r.cfg;
+    curFn = 0;
+    let blocks = 0, loopCount = 0;
+    DATA.functions.forEach(f => {
+      blocks += f.blocks.length;
+      loopCount += f.loops.length;
+    });
+    document.getElementById("cfg-stats").textContent =
+      `${DATA.functions.length} 个函数 · ${blocks} 个基本块 · ${loopCount} 个循环 · 递归组 ${DATA.call_graph.recursive_groups.length} 个`;
+    renderTabs();
+    renderCallGraph();
+    render();
+  }
+
+  document.getElementById("btn-build").onclick = build;
+  document.getElementById("opt-dead").onchange = () => { if (DATA) render(); };
+})();
+</script>
+</body>
+</html>

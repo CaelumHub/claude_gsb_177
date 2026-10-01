@@ -315,6 +315,118 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .bc-fn-tabs button { padding: 5px 12px; border-radius: 20px; border: 1px solid var(--border-strong); background: var(--surface); cursor: pointer; font-size: 12px; }
 .bc-fn-tabs button.active { background: var(--primary); color: #fff; border-color: var(--primary); }
 
+/* ---------- 控制流图（CFG） ---------- */
+.cfg-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.cfg-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.cfg-tab { padding: 5px 12px; border-radius: 20px; border: 1px solid var(--border-strong); background: var(--surface); cursor: pointer; font-size: 12px; }
+.cfg-tab.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+.cfg-tab .rec { color: var(--warning); font-weight: 700; margin-left:2px; }
+.cfg-tab.active .rec { color: #ffe4a3; }
+
+.cfg-scroll { overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
+.cfg-canvas { position: relative; margin: 0 auto; }
+
+.cfg-block {
+  position: absolute; width: 300px;
+  border: 1.5px solid var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--surface); box-shadow: var(--shadow);
+  font-family: var(--mono); font-size: 12px;
+}
+.cfg-block.depth-1 { border-left: 4px solid var(--accent); }
+.cfg-block.depth-2 { border-left: 4px solid var(--primary); }
+.cfg-block.depth-3 { border-left: 4px solid var(--warning); }
+.cfg-block.unreachable { border-style: dashed; opacity: .62; background: var(--surface-2); }
+.cfg-block.sel { outline: 2px solid var(--primary); outline-offset: 1px; }
+.cfg-block .bb-head {
+  display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+  background: var(--surface-2); border-bottom: 1px solid var(--border);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0; font-size: 11px;
+}
+.cfg-block .bb-head .bid { font-weight: 700; color: var(--primary); }
+.cfg-block .bb-head .tag { font-size: 10px; padding: 0 6px; border-radius: 10px; background: var(--surface-3); color: var(--text-muted); }
+.cfg-block .bb-head .tag.entry { background: var(--success-soft); color: var(--success); }
+.cfg-block .bb-head .tag.ret { background: var(--danger-soft); color: var(--danger); }
+.cfg-block .bb-head .tag.dead { background: var(--danger-soft); color: var(--danger); }
+.cfg-block .bb-head .rng { margin-left: auto; color: var(--text-faint); }
+.cfg-block .ins {
+  display: flex; gap: 8px; padding: 1px 8px; line-height: 18px;
+  white-space: nowrap; cursor: default;
+}
+.cfg-block .ins:hover { background: var(--primary-soft); }
+.cfg-block .ins .off { color: var(--text-faint); width: 26px; text-align: right; flex: 0 0 auto; }
+.cfg-block .ins .op { color: var(--primary); font-weight: 600; width: 118px; flex: 0 0 auto; }
+.cfg-block .ins.jump .op { color: var(--warning); }
+.cfg-block .ins.ret .op { color: var(--danger); }
+.cfg-block .ins.call .op { color: var(--accent); }
+.cfg-block .ins .arg { color: var(--accent); overflow: hidden; text-overflow: ellipsis; }
+.cfg-block .ins .ln { margin-left: auto; color: var(--text-faint); font-size: 10.5px; }
+.cfg-block .call-row {
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 3px 8px;
+  border-top: 1px dashed var(--border); background: var(--accent-soft);
+}
+.cfg-chip {
+  font-size: 10.5px; padding: 0 8px; border-radius: 10px; cursor: pointer;
+  background: var(--accent); color: #fff; border: none; font-family: var(--mono);
+}
+.cfg-chip.bi { background: var(--surface-3); color: var(--text-muted); cursor: default; }
+.cfg-chip:hover { filter: brightness(1.08); }
+
+.cfg-exit {
+  position: absolute; width: 92px; text-align: center;
+  border: 1.5px solid var(--danger); color: var(--danger);
+  border-radius: 20px; padding: 4px 0; font-weight: 700; font-size: 12px;
+  background: var(--surface);
+}
+.cfg-entry {
+  position: absolute; width: 92px; text-align: center;
+  border: 1.5px solid var(--success); color: var(--success);
+  border-radius: 20px; padding: 4px 0; font-weight: 700; font-size: 12px;
+  background: var(--surface);
+}
+.cfg-edges { position: absolute; inset: 0; pointer-events: none; }
+.cfg-edges path { fill: none; stroke-width: 1.6; }
+.cfg-edges .e-fall { stroke: var(--border-strong); }
+.cfg-edges .e-branch { stroke: var(--info); }
+.cfg-edges .e-branch.true { stroke: var(--success); }
+.cfg-edges .e-jump { stroke: var(--text-muted); }
+.cfg-edges .e-back { stroke: var(--primary); stroke-width: 2; }
+.cfg-edges .e-break { stroke: var(--danger); }
+.cfg-edges .e-continue { stroke: var(--info); }
+.cfg-edges .e-return { stroke: var(--danger); stroke-dasharray: 5 3; }
+.cfg-edges path.hl { stroke-width: 3.4; }
+.cfg-edges .elbl {
+  font-size: 10px; fill: var(--text); font-family: var(--mono);
+  paint-order: stroke; stroke: var(--surface); stroke-width: 3px;
+}
+.cfg-loop-box {
+  position: absolute; border: 1.5px dashed var(--accent);
+  border-radius: var(--radius); pointer-events: none;
+}
+.cfg-loop-box.depth-2 { border-color: var(--primary); }
+.cfg-loop-box.depth-3 { border-color: var(--warning); }
+.cfg-loop-box .lp-tag {
+  position: absolute; top: -9px; left: 10px;
+  font-size: 10.5px; font-weight: 700; padding: 0 8px;
+  background: var(--surface-2); color: var(--accent);
+  border: 1px solid var(--accent); border-radius: 10px;
+}
+.cfg-loop-box.depth-2 .lp-tag { color: var(--primary); border-color: var(--primary); }
+.cfg-loop-box.depth-3 .lp-tag { color: var(--warning); border-color: var(--warning); }
+
+.cfg-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--text-muted); }
+.cfg-legend .sw { display: inline-block; width: 22px; height: 0; border-top-width: 2.5px; border-top-style: solid; vertical-align: middle; margin-right: 5px; }
+.cfg-callgraph { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+.cfg-callgraph .cg-wrap { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.cg-node {
+  padding: 4px 12px; border-radius: 16px; border: 1px solid var(--border-strong);
+  background: var(--surface); cursor: pointer; font-family: var(--mono); font-size: 12px;
+}
+.cg-node.main { border-color: var(--success); color: var(--success); }
+.cg-node.rec { border-color: var(--warning); color: var(--warning); font-weight: 700; }
+.cg-node.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+.cg-arrow { color: var(--text-faint); font-size: 11px; }
+.cg-group { border: 1px dashed var(--warning); border-radius: 20px; padding: 3px 10px 3px 4px; }
+
 /* ---------- 调用栈 / 变量监视 ---------- */
 .callstack .frame { border-left: 3px solid var(--primary); padding: 8px 12px; margin-bottom: 8px; background: var(--surface-2); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
 .callstack .frame.top { border-left-color: var(--accent); }

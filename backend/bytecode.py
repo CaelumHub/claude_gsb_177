@@ -51,6 +51,7 @@ class Instruction:
     operand: Any = None      # 操作数：常量索引 / 名字 / 运算符 / 跳转偏移 / 参数个数
     line: int = 1            # 对应源码行号（1-based）
     offset: int = 0          # 指令在代码段内的偏移（由 FunctionCode 回填）
+    note: str = ""           # 跳转语义标记（break/continue/while_back/for_back），供 CFG 连边
 
     def describe_operand(self) -> str:
         if self.op in (OP_LOAD_CONST, OP_MAKE_LIST, OP_CALL, OP_JUMP,
@@ -59,12 +60,15 @@ class Instruction:
         return repr(self.operand) if self.operand is not None else ""
 
     def to_dict(self):
-        return {
+        d = {
             "offset": self.offset,
             "op": self.op,
             "operand": self.operand,
             "line": self.line,
         }
+        if self.note:
+            d["note"] = self.note
+        return d
 
     def __repr__(self):
         return f"{self.offset:>4}  {self.op:<16} {self.describe_operand()}  (L{self.line})"

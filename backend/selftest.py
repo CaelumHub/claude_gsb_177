@@ -19,6 +19,8 @@ from . import profiler as profiler_mod
 from . import storage
 from . import memory_model
 from . import diagnostics as diag
+from . import cfg as cfg_mod
+from . import bytecode as bc
 
 
 _RESULTS = []
@@ -48,6 +50,8 @@ def run_all():
     _test_vm_basic()
     _test_functions_recursion()
     _test_control_flow()
+    _test_cfg()
+    _test_optimizer_jump_remap()
     _test_lists()
     _test_runtime_errors()
     _test_debugger()
@@ -124,6 +128,125 @@ def _test_control_flow():
     out = _run(src)
     ok = out.get("ok") and out["output"] == ["10 30 100"]
     _check("解释器：for/while/if-elif-else 控制流", ok, str(out.get("output")))
+
+
+def _test_cfg():
+    """控制流图：基本块不漏指令、边与字节码跳转一一对应、循环/递归/提前返回正确。"""
+    def owner(cfg, t):
+        return next(b["id"] for b in cfg["blocks"]
+                    if b["start_index"] <= t < b["start_index"] + len(b["instructions"]))
+
+    def validate(src, fname):
+        res = compiler.compile_source(src)
+        assert res.success, res.diagnostics.to_list()
+        g = cfg_mod.build_program_cfg(res.bytecode)
+        fc = res.bytecode.main if fname == "<main>" else res.bytecode.functions[fname]
+        cfg = next(x for x in g["functions"] if x["name"] == fname)
+        ins, n = fc.instructions, len(fc.instructions)
+        # 1) 基本块不重不漏地覆盖每条指令
+        cover = sorted(k for b in cfg["blocks"]
+                       for k in range(b["start_index"],
+                                      b["start_index"] + len(b["instructions"])))
+        assert cover == list(range(n)), "基本块未完整覆盖指令"
+        # 2) 每条边与终结指令语义一致（不错连）
+        for b in cfg["blocks"]:
+            li = b["start_index"] + len(b["instructions"]) - 1
+            last = ins[li]
+            outs = [e for e in cfg["edges"] if e["src"] == b["id"]]
+            if last.op == bc.OP_JUMP:
+                assert len(outs) == 1 and (
+                    outs[0].get("to_exit") if last.operand >= n
+                    else (not outs[0].get("to_exit")
+                          and outs[0]["dst"] == owner(cfg, last.operand)))
+            elif last.op in (bc.OP_JUMP_IF_FALSE, bc.OP_JUMP_IF_TRUE):
+                # 两条条件边（假/真；可能因空体或折叠而落到同一块），
+                # 校验"跳转边"的目标与操作数一致
+                jump_side = "假" if last.op == bc.OP_JUMP_IF_FALSE else "真"
+                j = next(e for e in outs
+                         if e["label"].replace("·短路", "").startswith(jump_side))
+                assert (j.get("to_exit") and last.operand >= n) or (
+                    not j.get("to_exit") and j["dst"] == owner(cfg, last.operand))
+                assert len(outs) == 2
+            elif last.op in (bc.OP_RETURN, bc.OP_RETURN_NONE):
+                assert len(outs) == 1 and outs[0].get("to_exit")
+            else:
+                assert len(outs) == 1
+                assert (outs[0].get("to_exit") if li + 1 >= n
+                        else outs[0]["dst"] == owner(cfg, li + 1))
+        # 3) 可达性：从入口沿边可达 == reachable 标记
+        reach, stk = {0}, [0]
+        while stk:
+            u = stk.pop()
+            for e in cfg["edges"]:
+                if e["src"] == u and not e.get("to_exit") and e["dst"] not in reach:
+                    reach.add(e["dst"])
+                    stk.append(e["dst"])
+        assert all(b["reachable"] == (b["id"] in reach) for b in cfg["blocks"])
+        return g, cfg
+
+    # 递归 + 提前 return（if 分支直接返回，尾部汇合块不可达但保留）
+    fib = ("func fib(n) {\n    if (n < 2) { return n; }\n"
+           "    return fib(n - 1) + fib(n - 2);\n}\nprint(fib(10));\n")
+    g, cfg = validate(fib, "fib")
+    assert any(g["call_graph"]["recursive_groups"]), "fib 应被识别为递归"
+    ret_edges = [e for e in cfg["edges"] if e["kind"] == "return"]
+    assert len(ret_edges) >= 2, "提前 return 与函数尾 return 各有一条返回边"
+    assert any(not b["reachable"] for b in cfg["blocks"]), "return 后死代码应标记不可达"
+
+    # 多层循环 + break/continue + 循环内 return：回边/退出边齐全
+    nested = (
+        "func f() {\n"
+        "    var s = 0;\n"
+        "    for (var i = 0; i < 10; i = i + 1) {\n"
+        "        while (i < 3) { if (i == 1) { break; } continue; }\n"
+        "        for (var j = 0; j < 2; j = j + 1) {\n"
+        "            if (j == 99) { return -1; }\n"
+        "            s = s + j;\n"
+        "        }\n"
+        "    }\n"
+        "    return s;\n"
+        "}\nprint(f());\n")
+    g, cfg = validate(nested, "f")
+    assert len(cfg["loops"]) == 3, f"应有 3 个自然循环，实际 {len(cfg['loops'])}"
+    depths = sorted(lp["depth"] for lp in cfg["loops"])
+    assert depths == [1, 2, 2], f"嵌套深度应为 [1,2,2]，实际 {depths}"
+    labels = {e["label"] for e in cfg["edges"]}
+    assert "break" in labels and "continue" in labels and "循环回边" in labels
+    assert [lp["kind"] for lp in cfg["loops"]].count("for") == 2
+
+    # for(;;) 死循环 + 提前退出：出口边折叠后仍能识别为 for 循环
+    inf = "func h(n) { for (;;) { n = n - 1; if (n <= 0) { return n; } } }\nprint(h(5));\n"
+    _g, cfg = validate(inf, "h")
+    assert len(cfg["loops"]) == 1 and cfg["loops"][0]["kind"] == "for"
+
+    # 互递归 SCC
+    mutual = ("func a(n) { if (n == 0) { return 1; } return b(n - 1); }\n"
+              "func b(n) { if (n == 0) { return 0; } return a(n - 1); }\nprint(a(4));\n")
+    res = compiler.compile_source(mutual)
+    g = cfg_mod.build_program_cfg(res.bytecode)
+    groups = [grp for grp in g["call_graph"]["recursive_groups"] if set(grp) == {"a", "b"}]
+    assert groups, "a/b 应被识别为互递归"
+    _check("控制流图：基本块/边完整性 + 多层循环 + 递归 + 提前返回", True)
+
+
+def _test_optimizer_jump_remap():
+    """窥孔优化删除 LOAD_CONST;POP 后必须重定位跳转目标（历史上会导致 VM 崩溃）。"""
+    src = ("var i = 0;\n"
+           "while (i < 1) {\n"
+           "    1;\n"          # 表达式语句 -> LOAD_CONST;POP，会被优化删除
+           "    i = i + 1;\n"
+           "}\n"
+           'print("done");\n')
+    out = _run(src)
+    ok = out.get("ok") and out["output"] == ["done"]
+    # 所有跳转目标落在 [0, n] 内
+    res = compiler.compile_source(src)
+    for fc in [res.bytecode.main] + list(res.bytecode.functions.values()):
+        m = len(fc.instructions)
+        for ins in fc.instructions:
+            if ins.op in ("JUMP", "JUMP_IF_FALSE", "JUMP_IF_TRUE"):
+                assert 0 <= ins.operand <= m
+    _check("字节码优化：删除指令后跳转目标重定位", ok, str(out.get("error")))
 
 
 def _test_lists():
