@@ -407,6 +407,101 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .diff-line.del { background: var(--danger-soft); color: var(--danger); }
 .diff-line .mark { margin-right: 8px; font-weight: 700; }
 
+/* ---------- 控制流图（CFG） ---------- */
+.cfg-canvas {
+  position: relative; overflow: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg);
+  background-image: radial-gradient(circle, var(--border-strong) 1px, transparent 1px);
+  background-size: 22px 22px;
+  min-height: 320px; max-height: 75vh;
+}
+.cfg-stage-wrap { position: relative; padding: 4px; }
+.cfg-stage { position: absolute; left: 4px; top: 4px; will-change: transform; }
+.cfg-svg { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+.cfg-svg path.cfg-edge { pointer-events: stroke; stroke-width: 1.6; transition: opacity .12s; }
+.cfg-edge.dim { opacity: .12; }
+.cfg-edge.hot { stroke-width: 3; }
+.cfg-e-fall { stroke: var(--text-faint); }
+.cfg-e-branch { stroke: var(--warning); }
+.cfg-e-back { stroke: var(--info); }
+.cfg-e-return { stroke: var(--danger); }
+.cfg-e-call { stroke: var(--accent); stroke-width: 1.8; }
+.cfg-edge.dashed { stroke-dasharray: 6 4; }
+.cfg-edge.dead { opacity: .4; stroke-dasharray: 3 3; }
+.cfg-edge.self { stroke-width: 1.6; }
+.cfg-nodes, .cfg-edge-labels { position: absolute; left: 0; top: 0; }
+.cfg-lane-head { position: absolute; display: flex; align-items: center; gap: 8px; z-index: 3; }
+.cfg-lane-title { font-weight: 700; font-size: 13.5px; font-family: var(--mono); color: var(--primary); }
+.cfg-block {
+  position: absolute; background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow); font-size: 11.5px;
+  z-index: 2; transition: box-shadow .12s, border-color .12s;
+}
+.cfg-block:hover { border-color: var(--primary); box-shadow: var(--shadow-lg); }
+.cfg-block.unreachable { border-style: dashed; border-color: var(--danger); background: var(--danger-soft); }
+.cfg-block-head {
+  display: flex; align-items: center; gap: 8px; padding: 3px 10px;
+  border-bottom: 1px solid var(--border); background: var(--surface-2);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0; font-family: var(--mono);
+}
+.cfg-block.unreachable .cfg-block-head { background: transparent; }
+.cfg-bid { font-weight: 700; color: var(--primary); }
+.cfg-brng, .cfg-blr { color: var(--text-faint); font-size: 10.5px; }
+.cfg-blr { margin-left: auto; }
+.cfg-instrs { padding: 2px 0; }
+.cfg-instr {
+  display: flex; align-items: baseline; gap: 8px; height: 19px;
+  padding: 0 10px; white-space: nowrap; font-family: var(--mono);
+}
+.cfg-instr .cfg-i-off { width: 24px; color: var(--text-faint); flex: 0 0 auto; text-align: right; }
+.cfg-instr .cfg-i-op { color: var(--primary); font-weight: 600; width: 104px; flex: 0 0 auto; }
+.cfg-instr.term .cfg-i-op { color: var(--danger); }
+.cfg-instr .cfg-arg { color: var(--accent); }
+.cfg-instr .cfg-src {
+  color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left;
+}
+.cfg-instr.term .cfg-arg { color: var(--warning); }
+.cfg-calls { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px 8px 5px; }
+.cfg-chip {
+  font-family: var(--mono); font-size: 10.5px; padding: 0 8px; border-radius: 20px;
+  border: 1px solid var(--border-strong); background: var(--surface-2); color: var(--text-muted);
+}
+.cfg-chip.fn { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.cfg-chip.bi { color: var(--text-muted); }
+.cfg-chip.dyn { color: var(--warning); border-color: var(--warning); background: var(--warning-soft); }
+.cfg-term {
+  position: absolute; display: grid; place-items: center; z-index: 2;
+  border-radius: 20px; font-size: 12px; font-weight: 700;
+}
+.cfg-term-entry { background: var(--success-soft); color: var(--success); border: 1.5px solid var(--success); }
+.cfg-term-exit { background: var(--danger-soft); color: var(--danger); border: 1.5px solid var(--danger); }
+.cfg-elabel {
+  position: absolute; font-size: 10.5px; font-weight: 700; padding: 0 5px;
+  border-radius: 4px; background: var(--surface); white-space: nowrap; z-index: 4;
+  font-family: var(--mono); line-height: 1.5;
+}
+.cfg-lb-fall { color: var(--text-muted); }
+.cfg-lb-branch { color: var(--warning); }
+.cfg-lb-back { color: var(--info); }
+.cfg-lb-return { color: var(--danger); }
+.cfg-lb-call { color: var(--accent); background: var(--accent-soft); }
+.cfg-lb-dead { color: var(--danger); opacity: .8; }
+.cfg-elabel.dead { opacity: .5; }
+.cfg-filter { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
+.cfg-sw.branch { color: var(--warning); font-weight: 600; }
+.cfg-sw.back { color: var(--info); font-weight: 600; }
+.cfg-sw.return { color: var(--danger); font-weight: 600; }
+.cfg-sw.call { color: var(--accent); font-weight: 600; }
+.cfg-legend-swatch { display: inline-block; width: 26px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+.cfg-legend-swatch.fall { background: var(--text-faint); }
+.cfg-legend-swatch.branch { background: var(--warning); }
+.cfg-legend-swatch.back { background: var(--info); }
+.cfg-legend-swatch.return { background: var(--danger); }
+.cfg-legend-swatch.call { background: var(--accent); }
+.cfg-legend-notes { margin: 10px 0 0 18px; font-size: 12px; line-height: 1.9; }
+.cfg-legend-notes code { background: var(--surface-2); padding: 0 5px; border-radius: 4px; }
+
 /* ---------- 杂项 ---------- */
 .flex { display: flex; gap: 10px; align-items: center; }
 .flex.wrap { flex-wrap: wrap; }

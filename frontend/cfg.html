@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>控制流图（CFG） · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <button class="btn primary" id="btn-build">🕸 生成控制流图</button>
+      </div>
+
+      <div id="editor"></div>
+
+      <div class="card mt">
+        <div class="flex wrap between" style="gap:10px">
+          <h2 style="margin-bottom:0">控制流图（Control Flow Graph）</h2>
+          <div id="cfg-stats" class="muted" style="font-size:12px"></div>
+        </div>
+        <div class="desc">
+          以真实字节码做前导指令（leader）分析切分基本块：跳转 / 条件跳转 / 返回指令的目标与下一指令都是新块的起点。
+          边直接由实发指令推导，因此 <b>if 分支、while/for 循环回边、break/continue、提前 return 与函数尾返回</b>
+          都能准确呈现；CALL 经栈模拟还原被调函数，<b>递归显示为自环、互递归显示为跨函数调用边</b>。
+          块标题与「字节码」页偏移（1 起）、行号完全对齐。
+        </div>
+
+        <div class="flex wrap between" style="gap:10px;margin-bottom:10px">
+          <div id="cfg-fn-tabs" class="bc-fn-tabs" style="margin-bottom:0"></div>
+          <div class="flex wrap" style="gap:12px;font-size:12px;color:var(--text-muted)">
+            <label class="cfg-filter"><input type="checkbox" data-kind="fall" checked> 顺序/跳转</label>
+            <label class="cfg-filter"><input type="checkbox" data-kind="branch" checked> <span class="cfg-sw branch">条件</span></label>
+            <label class="cfg-filter"><input type="checkbox" data-kind="back" checked> <span class="cfg-sw back">循环回边</span></label>
+            <label class="cfg-filter"><input type="checkbox" data-kind="return" checked> <span class="cfg-sw return">返回</span></label>
+            <label class="cfg-filter"><input type="checkbox" data-kind="call" checked> <span class="cfg-sw call">函数调用</span></label>
+          </div>
+        </div>
+
+        <div class="flex wrap" style="gap:8px;margin-bottom:10px">
+          <button class="btn sm" id="btn-zoomin">＋ 放大</button>
+          <button class="btn sm" id="btn-zoomout">－ 缩小</button>
+          <button class="btn sm" id="btn-fit">↔ 适配宽度</button>
+          <button class="btn sm" id="btn-reset">100%</button>
+          <label class="flex" style="gap:6px;font-size:12px;color:var(--text-muted)">
+            <input type="checkbox" id="chk-src" checked> 块内显示源码
+          </label>
+          <span id="cfg-zoom-label" class="muted" style="font-size:12px"></span>
+        </div>
+
+        <div id="cfg-canvas" class="cfg-canvas">
+          <div class="empty"><div class="big">🕸</div>输入源码后点击「生成控制流图」</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>图例与阅读说明</h2>
+        <div class="flex wrap" style="gap:16px;font-size:12.5px">
+          <span><span class="cfg-legend-swatch fall"></span>顺序执行 / 无条件跳转（break 跳出）</span>
+          <span><span class="cfg-legend-swatch branch"></span>条件分支（真 / 假两条边）</span>
+          <span><span class="cfg-legend-swatch back"></span>循环回边（回到条件处，含 continue）</span>
+          <span><span class="cfg-legend-swatch return"></span>返回到函数出口（含提前 return）</span>
+          <span><span class="cfg-legend-swatch call"></span>调用用户函数（跨泳道；自环=递归）</span>
+        </div>
+        <ul class="cfg-legend-notes muted">
+          <li>每个函数一条<b>泳道</b>，最上方为 <b>&lt;main&gt; 顶层</b>；基本块 <b>B0</b> 从函数入口可达。</li>
+          <li>块头标注字节码偏移区间（如 <code>3–7</code>）与源码行号区间，与「字节码 / 中间代码」页一致；跳转目标 <code>→ N</code> 为目标指令的偏移。</li>
+          <li>红底「不可达」块是 return 之后仍存在于字节码中的代码（如条件编译出的死跳转目标），仍完整画出以免漏边。</li>
+          <li>逻辑短路（<code>&amp;&amp;</code> / <code>||</code>）在字节码层也是条件跳转，图中以条件边如实呈现。</li>
+        </ul>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script src="js/cfg.js"></script>
+<script>
+(function () {
+  ML.Shell.render("cfg");
+  ML.Shell.setTitle("控制流图（CFG）");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE), height: 220,
+    onValueChange: (v) => ML.store.set("draft_source", v),
+  });
+
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => {
+    if (sampleSel.value === "") return;
+    editor.setValue(ML.SAMPLES[+sampleSel.value].code);
+    sampleSel.value = "";
+  };
+  document.getElementById("btn-loadproj").onclick = async () => {
+    const src = await ML.Shell.loadSource(ML.DEFAULT_CODE);
+    editor.setValue(src);
+  };
+
+  const canvas = document.getElementById("cfg-canvas");
+  let renderer = null, graph = null, zoom = 1, sourceLines = [];
+
+  function visibleKinds() {
+    const ks = [];
+    document.querySelectorAll(".cfg-filter input").forEach((cb) => { if (cb.checked) ks.push(cb.dataset.kind); });
+    return ks;
+  }
+
+  function rerender() {
+    if (!graph || !renderer) return;
+    const layout = ML.CFG.layout(graph, visibleKinds());
+    renderer.setSource(sourceLines);
+    renderer.render(graph, layout, { showSource: document.getElementById("chk-src").checked });
+    applyZoom(false);
+    updateStats();
+  }
+
+  function updateStats() {
+    const s = ML.CFG.summarize(graph);
+    const shown = visibleKinds();
+    let edgeTotal = 0;
+    shown.forEach((k) => { edgeTotal += s.edges[k]; });
+    document.getElementById("cfg-stats").innerHTML =
+      `${s.functions} 个代码段 · ${s.blocks} 个基本块` +
+      (s.dead ? ` · <span style="color:var(--danger)">${s.dead} 不可达</span>` : "") +
+      ` · 当前显示 ${edgeTotal} 条控制流边` +
+      (s.recursiveFns.length ? ` · 递归函数：${s.recursiveFns.map(ML.escapeHtml).join("、")}` : "");
+  }
+
+  function applyZoom(fitWidth) {
+    const stage = canvas.querySelector(".cfg-stage");
+    const wrap = canvas.querySelector(".cfg-stage-wrap");
+    if (!stage || !wrap) return;
+    if (fitWidth) {
+      const w = parseFloat(stage.style.width) || 1;
+      zoom = Math.min(1.25, Math.max(0.4, (canvas.clientWidth - 40) / w));
+    }
+    const w = parseFloat(stage.style.width) || 0, h = parseFloat(stage.style.height) || 0;
+    stage.style.transform = `scale(${zoom})`;
+    stage.style.transformOrigin = "0 0";
+    // scale 不改变布局尺寸：用包裹层撑起缩放后的滚动区域
+    wrap.style.width = w * zoom + "px";
+    wrap.style.height = h * zoom + "px";
+    document.getElementById("cfg-zoom-label").textContent = Math.round(zoom * 100) + "%";
+  }
+
+  async function build() {
+    const code = editor.getValue();
+    ML.store.set("draft_source", code);
+    sourceLines = code.split("\n");
+    const data = await ML.api.compile(code);
+    const r = data.result || {};
+    if (!r.has_bytecode || !r.bytecode) {
+      canvas.innerHTML = `<div class="empty"><div class="big">🚫</div>无法生成控制流图（编译未通过）。<br><a href="diagnostics.html">前往诊断页查看错误</a></div>`;
+      renderer = null; graph = null;
+      document.getElementById("cfg-stats").textContent = "";
+      return;
+    }
+    canvas.innerHTML = "";
+    graph = ML.CFG.build(r.bytecode);
+    renderer = new ML.CFG.Renderer(canvas);
+    rerender();
+    applyZoom(true);
+  }
+
+  document.getElementById("btn-build").onclick = build;
+  document.getElementById("btn-zoomin").onclick = () => { zoom = Math.min(1.6, zoom + 0.1); applyZoom(false); };
+  document.getElementById("btn-zoomout").onclick = () => { zoom = Math.max(0.35, zoom - 0.1); applyZoom(false); };
+  document.getElementById("btn-fit").onclick = () => applyZoom(true);
+  document.getElementById("btn-reset").onclick = () => { zoom = 1; applyZoom(false); };
+  document.getElementById("chk-src").onchange = rerender;
+  document.querySelectorAll(".cfg-filter input").forEach((cb) => { cb.onchange = rerender; });
+  window.addEventListener("resize", () => { if (graph) applyZoom(false); });
+})();
+</script>
+</body>
+</html>
